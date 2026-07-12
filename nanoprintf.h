@@ -539,6 +539,7 @@ static char const *npf_parse_format_spec_end(char const *format,
   // (lowercased letter - 'a'). '%' is handled out-of-line since it's the only
   // non-letter conversion. case_adjust gets bit 5 of the original char.
   char const c = *cur++;
+  char const ca = (char)(c & 32); // 32 for lowercase, 0 for uppercase
   uint_fast8_t cs;
   if (c == '%') {
     cs = NPF_FMT_SPEC_CONV_PERCENT;
@@ -580,11 +581,11 @@ static char const *npf_parse_format_spec_end(char const *format,
       0, 0,                              // 'v', 'w'
       NPF_FMT_SPEC_CONV_HEX_INT,         // 'x'
     };
-    unsigned const idx = (unsigned)((c | 32) - 'a');
+    unsigned const idx = (unsigned)((c - ca) - 'A'); // == (c | 32) - 'a'
     if (idx >= sizeof(lookup) || !(cs = lookup[idx])) { return NULL; }
   }
   out_spec->conv_spec = (uint8_t)cs;
-  out_spec->case_adjust = (char)(c & 32); // 32 for lowercase, 0 for uppercase
+  out_spec->case_adjust = ca;
 
   return cur;
 }
@@ -609,18 +610,22 @@ static NPF_NOINLINE uint32_t npf_div10(uint32_t n) {
 #endif
 
 static NPF_NOINLINE char *npf_utoa_rev_end(
-    npf_uint_t val, char *buf, uint_fast8_t base, char case_adj) {
+    npf_uint_t val, char *buf, uint_fast8_t base, uint_fast8_t case_adj) {
 #if (NANOPRINTF_USE_LARGE_FORMAT_SPECIFIERS == 1) || \
     ((NANOPRINTF_USE_DIVISION_FREE_CONVERSION == 1) && NPF_UINT_IS_WIDE)
-  // Use shift and subtract here to avoid hw div operation
+  // Bit-at-a-time divmod, 32-bit loop below handles all typical values.
   while (val > 0xFFFFFFFFu) {
-    npf_uint_t q = 0, r = 0;
-    for (int i = (int)(sizeof(val) * 8) - 1; i >= 0; --i) {
-      r = (r << 1) | ((val >> i) & 1);
-      if (r >= (npf_uint_t)base) { r -= base; q |= (npf_uint_t)1 << i; }
+    npf_uint_t q = 0;
+    uint_fast8_t r = 0;
+    for (unsigned i = (unsigned)(sizeof(val) * CHAR_BIT); i; --i) {
+      r = (uint_fast8_t)((r << 1) |
+                         (uint_fast8_t)(val >> (sizeof(val) * CHAR_BIT - 1)));
+      val = (npf_uint_t)(val << 1);
+      q = (npf_uint_t)(q << 1);
+      if (r >= base) { r = (uint_fast8_t)(r - base); q |= 1u; }
     }
     int_fast8_t const d = (int_fast8_t)r;
-    *buf++ = (char)(((d < 10) ? '0' : ('A' - 10 + case_adj)) + d);
+    *buf++ = (char)(((d < 10) ? '0' : ('A' - 10 + (int)case_adj)) + d);
     val = q;
   }
   uint32_t v32 = (uint32_t)val;
@@ -642,7 +647,7 @@ static NPF_NOINLINE char *npf_utoa_rev_end(
     int_fast8_t const d = (int_fast8_t)(v32 % base);
     v32 /= base;
 #endif
-    *buf++ = (char)(((d < 10) ? '0' : ('A' - 10 + case_adj)) + d);
+    *buf++ = (char)(((d < 10) ? '0' : ('A' - 10 + (int)case_adj)) + d);
   } while (v32);
   return buf;
 }
@@ -650,7 +655,7 @@ static NPF_NOINLINE char *npf_utoa_rev_end(
 // Length-returning facade over npf_utoa_rev_end.
 static NPF_FORCE_INLINE int npf_utoa_rev(
     npf_uint_t val, char *buf, uint_fast8_t base, char case_adj) {
-  return (int)(npf_utoa_rev_end(val, buf, base, case_adj) - buf);
+  return (int)(npf_utoa_rev_end(val, buf, base, (uint_fast8_t)case_adj) - buf);
 }
 
 #if NANOPRINTF_USE_FLOAT_FORMAT_SPECIFIERS == 1
@@ -949,8 +954,7 @@ static NPF_NOINLINE int npf_atoa_rev(
     (npf_ftoa_exp_t)((npf_ftoa_exp_t)(bin >> NPF_DOUBLE_MAN_BITS) & NPF_DOUBLE_EXP_MASK);
   bin &= ((npf_double_bin_t)0x1 << NPF_DOUBLE_MAN_BITS) - 1;
 
-  if (exp == (npf_ftoa_exp_t)NPF_DOUBLE_EXP_MASK) { return 0; } // caller uses ftoa_rev
-
+  // Finite inputs only: the caller routes inf/nan to npf_ftoa_rev.
   if (exp) {
     bin |= (npf_double_bin_t)0x1 << NPF_DOUBLE_MAN_BITS;
     exp = (npf_ftoa_exp_t)(exp - NPF_DOUBLE_EXP_BIAS);
@@ -963,9 +967,9 @@ static NPF_NOINLINE int npf_atoa_rev(
     int end, i;
 
     // Discard low nibbles and round (only constant shifts of 3 and 4)
-    { npf_double_bin_t carry = 0;
+    { uint_fast8_t carry = 0;
       for (i = n_frac_dig - prec; i > 0; --i) {
-        carry = (bin >> 3) & 1;
+        carry = (uint_fast8_t)((bin >> 3) & 1);
         bin >>= 4;
       }
       bin += carry;
@@ -1000,9 +1004,8 @@ static NPF_NOINLINE int npf_atoa_rev(
 
 #if NANOPRINTF_USE_BINARY_FORMAT_SPECIFIERS == 1
 static int npf_bin_len(npf_uint_t u) {
-  // Return the length of the binary string format of 'u', preferring intrinsics.
-  if (!u) { return 1; }
-
+  // Return the length of the binary string format of 'u', preferring intrinsics
+  // when the target has a CLZ instruction.
 #ifdef _MSC_VER // Win64, use _BSR64 for everything. If x86, use _BSR when non-large.
   #ifdef _M_X64
     #define NPF_HAVE_BUILTIN_CLZ
@@ -1013,22 +1016,24 @@ static int npf_bin_len(npf_uint_t u) {
   #endif
   #ifdef NPF_HAVE_BUILTIN_CLZ
     unsigned long idx;
-    NPF_CLZ(&idx, u);
+    NPF_CLZ(&idx, u | 1);
     return (int)(idx + 1);
   #endif
-#elif NPF_CLANG || NPF_GCC_PAST_4_6
+#elif (NPF_CLANG || NPF_GCC_PAST_4_6) && \
+    !(defined(__arm__) && !defined(__ARM_FEATURE_CLZ)) && !defined(__AVR__)
   #define NPF_HAVE_BUILTIN_CLZ
   #if NANOPRINTF_USE_LARGE_FORMAT_SPECIFIERS == 1
     #define NPF_CLZ(X) ((sizeof(long long) * CHAR_BIT) - (size_t)__builtin_clzll(X))
   #else
     #define NPF_CLZ(X) ((sizeof(long) * CHAR_BIT) - (size_t)__builtin_clzl(X))
   #endif
-  return (int)NPF_CLZ(u);
+  return (int)NPF_CLZ(u | 1);
 #endif
 
 #ifndef NPF_HAVE_BUILTIN_CLZ
-  int n;
-  for (n = 0; u; ++n, u >>= 1); // slow but small software fallback
+  // No CLZ instruction: use a small loop instead
+  int n = 1;
+  while (u >>= 1) { ++n; }
   return n;
 #else
   #undef NPF_HAVE_BUILTIN_CLZ
@@ -1126,7 +1131,9 @@ int npf_vpprintf(npf_putc pc, void *pc_ctx, char const *format, va_list args) {
     char need_0x = 0;
 #if NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 1
     int field_pad = 0;
+#if NANOPRINTF_USE_PRECISION_FORMAT_SPECIFIERS == 0
     char pad_c = 0;
+#endif
 #endif
 #if NANOPRINTF_USE_PRECISION_FORMAT_SPECIFIERS == 1
     int prec_pad = 0;
@@ -1154,15 +1161,23 @@ int npf_vpprintf(npf_putc pc, void *pc_ctx, char const *format, va_list args) {
       }
 #endif
 
+#if NANOPRINTF_USE_FLOAT_HEX_FORMAT_SPECIFIER == 1
+      uint_fast8_t finite = 0;
+#endif
       { npf_real_bin_t const b = npf_real_to_int_rep(val);
         sign_c = (b >> NPF_REAL_SIGN_POS) ? '-' : fs.prepend;
 #if NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 1
         zero = !(b & ~((npf_real_bin_t)1 << NPF_REAL_SIGN_POS));
 #endif
+#if NANOPRINTF_USE_FLOAT_HEX_FORMAT_SPECIFIER == 1
+        // Exponent all-ones = inf/nan, which survives the (double) cast below.
+        finite = (uint_fast8_t)
+          ((((unsigned)(b >> NPF_REAL_MAN_BITS) + 1u) & NPF_REAL_EXP_MASK) != 0);
+#endif
       }
 #if NANOPRINTF_USE_FLOAT_HEX_FORMAT_SPECIFIER == 1
-      if ((fs.conv_spec == NPF_FMT_SPEC_CONV_FLOAT_HEX) &&
-          ((cbuf_len = npf_atoa_rev(cbuf, &fs, (double)val)) > 0)) {
+      if ((fs.conv_spec == NPF_FMT_SPEC_CONV_FLOAT_HEX) && finite) {
+        cbuf_len = npf_atoa_rev(cbuf, &fs, (double)val);
         need_0x = (char)('X' + fs.case_adjust);
       } else
 #endif
@@ -1312,16 +1327,13 @@ int npf_vpprintf(npf_putc pc, void *pc_ctx, char const *format, va_list args) {
       cbuf_len = 1;
     }
 
-#if NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 1
+#if (NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 1) && \
+    (NANOPRINTF_USE_PRECISION_FORMAT_SPECIFIERS == 0)
     // Compute the field width pad character. '0' flag only with numeric types,
-    // '-' overrides '0', and a blank result (prec.0 with zero value) suppresses '0'.
-    // With no field width, field_pad clamps to 0 below, so pad_c is never used.
+    // '-' overrides '0'. With no field width, field_pad clamps to 0 below, so
+    // pad_c is never used.
     pad_c = ' ';
-    if (fs.leading_zero_pad && !fs.left_justified
-#if NANOPRINTF_USE_PRECISION_FORMAT_SPECIFIERS == 1
-        && !((fs.prec_opt != NPF_FMT_SPEC_OPT_NONE) && !fs.prec && zero)
-#endif
-       ) { pad_c = '0'; }
+    if (fs.leading_zero_pad && !fs.left_justified) { pad_c = '0'; }
 #endif
 
     // Compute the number of bytes to truncate or '0'-pad. Skip for STRING
@@ -1336,35 +1348,43 @@ int npf_vpprintf(npf_putc pc, void *pc_ctx, char const *format, va_list args) {
 #endif
 
     // Total bytes this conversion emits; npf_n is bulk-updated at the end.
-    int spec_len = cbuf_len + !!sign_c + (need_0x ? 2 : 0)
+    int spec_len = cbuf_len
 #if NANOPRINTF_USE_PRECISION_FORMAT_SPECIFIERS == 1
                    + prec_pad
 #endif
                    ;
+    if (sign_c) { ++spec_len; }
+    if (need_0x) { spec_len += 2; }
 
 #if NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 1
     // Given the full converted length, how many pad bytes?
     field_pad = fs.field_width - spec_len;
     if (field_pad < 0) { field_pad = 0; }
     spec_len += field_pad;
-
+#endif
+    // spec_len is final; fold into npf_n now so it's dead across the emission loops.
+    npf_n += spec_len;
+#if NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 1
     // Right-justified padding: zero-pad goes AFTER sign/0x; space-pad goes BEFORE.
 #if NANOPRINTF_USE_PRECISION_FORMAT_SPECIFIERS == 1
-    // '0'-padding is contiguous with the leading precision zeros, so fold it into
-    // prec_pad; sign/0x is then emitted exactly once below. prec_pad stays 0 for
-    // STRING unless folded into, so the hoisted loop is a no-op there.
-    if (pad_c == '0') {
+    // '0' pads only numeric types, '-' overrides it, and a blank result (prec .0
+    // with zero value) suppresses it. '0' padding is contiguous with the leading
+    // precision zeros, so fold it into prec_pad; surviving field pad is a space.
+    if (fs.leading_zero_pad && !fs.left_justified &&
+        !((fs.prec_opt != NPF_FMT_SPEC_OPT_NONE) && !fs.prec && zero)) {
       prec_pad += field_pad;
       field_pad = 0;
     }
+#define NPF_PAD_C ' '
 #else
     if (pad_c == '0') {
       if (sign_c) { NPF_PUT(sign_c); sign_c = 0; }
       if (need_0x) { NPF_PUT('0'); NPF_PUT(need_0x); need_0x = 0; }
     }
+#define NPF_PAD_C pad_c
 #endif
     if (!fs.left_justified) {
-      while (field_pad-- > 0) { NPF_PUT(pad_c); }
+      while (field_pad-- > 0) { NPF_PUT(NPF_PAD_C); }
     }
 #endif
     if (sign_c) { NPF_PUT(sign_c); }
@@ -1390,10 +1410,9 @@ int npf_vpprintf(npf_putc pc, void *pc_ctx, char const *format, va_list args) {
     // Apply left-justified field width. The right-justified loop above has
     // already run field_pad below zero in the non-left-justified case, so
     // this loop body only executes for left-justified specifiers.
-    while (field_pad-- > 0) { NPF_PUT(pad_c); }
+    while (field_pad-- > 0) { NPF_PUT(NPF_PAD_C); }
+#undef NPF_PAD_C
 #endif
-    // NPF_PUT emissions don't tally npf_n; add the conversion's total length in bulk.
-    npf_n += spec_len;
   }
 
   return npf_n;
