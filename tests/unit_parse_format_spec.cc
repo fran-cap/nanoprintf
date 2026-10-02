@@ -181,21 +181,22 @@ TEST_CASE("npf_parse_format_spec") {
        as the beginning of a field width.
     */
 
-    SUBCASE("field width is none if not specified") {
+    SUBCASE("field width is zero if not specified") {
       REQUIRE(npf_parse_format_spec("%u", &spec) == 2);
-      REQUIRE(spec.field_width_opt == NPF_FMT_SPEC_OPT_NONE);
+      // An absent field width and a literal one are the same instruction to the
+      // caller -- use field_width as-is -- so absent is simply 0.
+      REQUIRE(spec.field_width == 0);
     }
 
     SUBCASE("field width star is captured") {
       REQUIRE(npf_parse_format_spec("%*u", &spec) == 3);
-      REQUIRE(spec.field_width_opt == NPF_FMT_SPEC_OPT_STAR);
+      // A literal width is never negative, so a negative one is how the parser
+      // says the width is in the argument list.
+      REQUIRE(spec.field_width < 0);
     }
 
     SUBCASE("field width is literal") {
       REQUIRE(npf_parse_format_spec("%123u", &spec) == 5);
-      // A literal field width and an absent one are the same instruction to the
-      // caller -- use field_width as-is -- so only STAR gets its own opt value.
-      REQUIRE(spec.field_width_opt == NPF_FMT_SPEC_OPT_NONE);
       REQUIRE(spec.field_width == 123);
     }
 
