@@ -139,12 +139,12 @@ TEST_CASE("npf_parse_format_spec") {
 
     SUBCASE("leading zero specified") {
       REQUIRE(npf_parse_format_spec("%0u", &spec) == 3);
-      REQUIRE(spec.leading_zero_pad == 1);
+      REQUIRE(spec.leading_zero_pad == '0'); // the flag character itself, as a truth value
     }
 
     SUBCASE("leading zero specified multiple times") {
       REQUIRE(npf_parse_format_spec("%00000u", &spec) == 7);
-      REQUIRE(spec.leading_zero_pad == 1);
+      REQUIRE(spec.leading_zero_pad == '0');
     }
 
     SUBCASE("leading zero with left justification is accepted") {

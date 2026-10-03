@@ -616,7 +616,7 @@ static char const *npf_parse_format_spec_end(char const *format,
     switch (*++cur) { // Optional flags; '\0' exits via default.
 #if NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 1
       case '-': out_spec->left_justified = '-'; continue;
-      case '0': out_spec->leading_zero_pad = 1; continue;
+      case '0': out_spec->leading_zero_pad = *cur; continue;
 #endif
       /* '+' wins over ' ' whichever order they come in. '+' is 0x2B and ' ' is 0x20,
          so OR-ing the flag in gets exactly that without comparing anything. */
@@ -845,7 +845,8 @@ static NPF_NOINLINE char *npf_utoa_rev_end(
       val = v32 / base;
 #endif
     }
-    *buf++ = (char)(((d < 10) ? '0' : ('A' - 10 + case_adj)) + d);
+    d = (int_fast8_t)((d > 9) ? (d + ('A' - 10 - '0')) : d); // letters sit 7 past the digits
+    *buf++ = (char)(('0' + d) | case_adj); // '0'-'9' already have bit 5 set, so the OR only lowers letters
   } while (val);
   return buf;
 }
@@ -1019,10 +1020,6 @@ static int npf_ftoa_rev(
         man_i = (npf_ftoa_man_t)bin;
       }
 
-      if (exp_i) {
-        exp = NPF_REAL_MAN_BITS; // invalidate the fraction part
-      }
-
       // Scale the exponent from base-2 to base-10.
       for (; exp_i; --exp_i) {
         if (!(man_i >> (NPF_FTOA_MAN_BITS - 1))) {
@@ -1072,8 +1069,10 @@ static int npf_ftoa_rev(
     npf_ftoa_man_t man_f;
     npf_ftoa_dec_t dec_f = (npf_ftoa_dec_t)prec;
 
-    if (exp < NPF_REAL_MAN_BITS) {
-      int_fast8_t shift_f = (int_fast8_t)((exp < 0) ? -1 : exp);
+    // No fraction once the integer part scaled (exp > NPF_FTOA_SHIFT_BITS) or when
+    // every mantissa bit is an integer bit; both bounds are constants.
+    if ((exp <= NPF_FTOA_SHIFT_BITS) && (exp < NPF_REAL_MAN_BITS)) {
+      int_fast8_t shift_f = (int_fast8_t)(exp | -(npf_ftoa_exp_t)(exp < 0)); // max(exp, -1)
       npf_ftoa_exp_t exp_f = (npf_ftoa_exp_t)(exp - shift_f);
       npf_real_bin_t bin_f =
         NPF_BIN_SHL(bin, (NPF_REAL_BIN_BITS - NPF_REAL_MAN_BITS) + shift_f);
@@ -1128,11 +1127,11 @@ static int npf_ftoa_rev(
       }
       man_f = (npf_ftoa_man_t)(man_f << 4);
     }
-    if (exp < NPF_REAL_MAN_BITS) {
+    if ((exp <= NPF_FTOA_SHIFT_BITS) && (exp < NPF_REAL_MAN_BITS)) {
       carry &= (uint_fast8_t)(man_f >> (NPF_FTOA_MAN_BITS - 1));
       // Ties to even: an exact half rounds up only when the last kept digit is odd.
       // Reversed that is buf[0], unless '#' with precision 0 put the point there.
-      if (man_f == ((npf_ftoa_man_t)0x1 << (NPF_FTOA_MAN_BITS - 1))) {
+      if (!(npf_ftoa_man_t)(man_f << 1)) { // top bit alone (or 0, and then carry is already 0)
         char lsd = buf[0];
 #if NANOPRINTF_USE_ALT_FORM_FLAG == 1
         if (lsd == '.') { lsd = buf[1]; }
@@ -1167,8 +1166,10 @@ exit:
    conditional source, rather than a fill and a copy: a plain fill loop is an idiom
    the compiler replaces with a call to memset. */
 static NPF_NOINLINE int npf_etoa_lay(char *buf, int o, int zeros, int src, int n) {
-  for (int i = -zeros; i < n; ++i) { buf[o++] = (i < 0) ? '0' : buf[src + i]; }
-  return o;
+  // Neither count is ever negative, so the run is zeros + n long: saying so spares
+  // the compiler a clamp of the trip count when it computes the return value.
+  for (int i = -zeros; i < n; ++i) { buf[o + zeros + i] = (i < 0) ? '0' : buf[src + i]; }
+  return o + zeros + n;
 }
 
 /* Scientific ('e'/'E') and shortest ('g'/'G') conversions.
@@ -1188,7 +1189,6 @@ static NPF_NOINLINE int npf_etoa_lay(char *buf, int o, int zeros, int src, int n
 static int npf_etoa_rev(char *buf, npf_format_spec_t const *spec, npf_real_t f) {
   // A 'goto exit' jumps over these, so none of them may have an initializer.
   int prec, nsig_max, nsig, dec, end, x, pe, fmode, dstop;
-  npf_ftoa_exp_t exp0;
 #if NANOPRINTF_USE_FLOAT_SHORTEST_FORMAT_SPECIFIER == 1
   int g, strip;
 #endif
@@ -1228,7 +1228,7 @@ static int npf_etoa_rev(char *buf, npf_format_spec_t const *spec, npf_real_t f) 
   strip = !spec->alt_form; // '#' keeps trailing zeros and the point
 #endif
   // 'g' precision counts significant digits, and 0 means 1.
-  if (g) { prec = prec ? prec : 1; nsig_max = prec; }
+  if (g) { prec += !prec; nsig_max = prec; }
 #endif
   if (fmode) {
     /* 'f' needs every digit down to 10^-prec, so the position stop below is what
@@ -1248,17 +1248,15 @@ static int npf_etoa_rev(char *buf, npf_format_spec_t const *spec, npf_real_t f) 
   }
   exp = (npf_ftoa_exp_t)(exp - NPF_REAL_EXP_BIAS);
 
-  exp0 = exp;
 #if NANOPRINTF_USE_FLOAT_SHORTEST_FORMAT_SPECIFIER == 1
 regen: // only 'g' comes back here, to switch from significance to position bounds
 #endif
-  exp = exp0; // generation clobbers exp to invalidate the fraction part
   carry = 0;
   dec = 0;
   // An exponent the integer scaling has to walk down loses remainders, so no tie is
   // visible there. Anything else starts out able to see one; the fraction part
   // below refines this to whether the digits it generates are the whole expansion.
-  tail = (uint_fast8_t)(exp0 <= NPF_FTOA_SHIFT_BITS);
+  tail = (uint_fast8_t)(exp <= NPF_FTOA_SHIFT_BITS);
 
   { // Integer part
     npf_ftoa_man_t man_i;
@@ -1274,10 +1272,6 @@ regen: // only 'g' comes back here, to switch from significance to position boun
         man_i = (npf_ftoa_man_t)(bin_i >> 1);
       } else {
         man_i = (npf_ftoa_man_t)bin;
-      }
-
-      if (exp_i) {
-        exp = NPF_REAL_MAN_BITS; // invalidate the fraction part
       }
 
       // Scale the exponent from base-2 to base-10. Every '0' npf_ftoa_rev would emit
@@ -1337,7 +1331,10 @@ regen: // only 'g' comes back here, to switch from significance to position boun
     int const lo = NPF_CBUF - nsig_max - 1;
     npf_ftoa_man_t man_f;
 
-    if (exp < NPF_REAL_MAN_BITS) {
+    /* There is no fraction once the integer scaling had to walk the exponent down
+       (exp > SHIFT_BITS), and none below the mantissa; both bounds are constants, so
+       the compiler folds them into one compare. */
+    if ((exp <= NPF_FTOA_SHIFT_BITS) && (exp < NPF_REAL_MAN_BITS)) {
       int_fast8_t shift_f = (int_fast8_t)((exp < 0) ? -1 : exp);
       npf_ftoa_exp_t exp_f = (npf_ftoa_exp_t)(exp - shift_f);
       npf_real_bin_t bin_f =
@@ -1450,11 +1447,13 @@ regen: // only 'g' comes back here, to switch from significance to position boun
   }
 
   x = dec + nsig - 1; // the base-10 exponent of the most significant digit
+  pe = prec; // digits after the point in the 'e' layout
 
 #if NANOPRINTF_USE_FLOAT_SHORTEST_FORMAT_SPECIFIER == 1
   if (g) {
     // Stripping moves 'dec' and 'nsig' by the same amount, so 'x' is unaffected.
     if (strip) { while ((nsig > 1) && (buf[end] == '0')) { ++end; --nsig; ++dec; } }
+    pe = (strip ? nsig : prec) - 1; // 'g' shows this many digits past the point
     if ((x >= -4) && (x < prec)) {
       /* C11 7.21.6.1p8: style 'f' with precision prec-1-x. That wants digits down
          to a decimal position rather than a count of them, and 'f' generation also
@@ -1462,7 +1461,7 @@ regen: // only 'g' comes back here, to switch from significance to position boun
          exponent, so this regenerates instead of relaying out the run already in
          the buffer. Same two passes npf_ftoa_rev used to provide, minus the second
          copy of the conversion. */
-      int const fp = (strip ? nsig : prec) - 1 - x;
+      int const fp = pe - x;
       prec = (fp > 0) ? fp : 0;
       fmode = 1;
       nsig_max = NPF_CBUF - 1;
@@ -1487,11 +1486,12 @@ regen: // only 'g' comes back here, to switch from significance to position boun
     int const iz = (dec > 0) ? dec : 0;             // integer zeros below the digits
     int const fd = nsig - id;                       // generated fraction digits
     int const fz = prec - fd;                       // fraction zeros past the digits
-    int dp = (prec > 0);
+    int dp = prec; // never negative here, so nonzero means a fraction follows
     int o;
 #if NANOPRINTF_USE_ALT_FORM_FLAG == 1
-    dp |= (spec->alt_form != 0);
+    dp |= spec->alt_form; // '#' demands the point even with no fraction
 #endif
+    dp = (dp != 0);
     // Same lockstep argument as the 'e' layout: reads and writes both walk up, so
     // the gap is tightest at the last read and this one check covers it.
     if ((id + iz + dp + prec) > NPF_CBUF) { goto exit; }
@@ -1502,14 +1502,12 @@ regen: // only 'g' comes back here, to switch from significance to position boun
 
   { // Compose "d.<frac>e<sign><exp>" reversed from buf[0] up.
     int o;
-    pe = prec; // digits after the point
-#if NANOPRINTF_USE_FLOAT_SHORTEST_FORMAT_SPECIFIER == 1
-    if (g) { pe = (strip ? nsig : prec) - 1; }
-#endif
     // The shared integer emitter already handles base 10 and the division-free path.
-    o = npf_utoa_rev((npf_uint_t)((x < 0) ? -x : x), buf, 10, 0);
-    if (o < 2) { buf[o++] = '0'; } // the standard mandates at least two digits
-    buf[o++] = (char)((x < 0) ? '-' : '+');
+    { int const neg = (x < 0); // 1 for a negative exponent
+      o = npf_utoa_rev((npf_uint_t)(neg ? -x : x), buf, 10, 0);
+      if (o < 2) { buf[o++] = '0'; } // the standard mandates at least two digits
+      buf[o++] = (char)('+' + 2 * neg); // '-' == '+' + 2
+    }
     buf[o++] = (char)('E' + spec->case_adjust);
 
     /* Reads walk up from buf[BUFSIZE - nsig] as writes walk up from buf[0]. Both
@@ -1520,10 +1518,11 @@ regen: // only 'g' comes back here, to switch from significance to position boun
        exceeds pe, and the pad is never negative. */
     o = npf_etoa_lay(buf, o, pe - (nsig - 1), NPF_CBUF - nsig, nsig - 1);
     // A point is emitted when a fraction follows it, or when '#' demands it.
-    { int dp = (pe > 0);
+    { int dp = pe; // never negative here, so nonzero means a fraction follows
 #if NANOPRINTF_USE_ALT_FORM_FLAG == 1
-      dp |= (spec->alt_form != 0);
+      dp |= spec->alt_form; // '#' demands the point even with no fraction
 #endif
+      dp = (dp != 0);
       buf[o] = '.'; o += dp; } // unconditional store, conditional advance
     buf[o++] = buf[NPF_CBUF - 1];
     return o;
@@ -1589,9 +1588,10 @@ static NPF_NOINLINE int npf_atoa_rev(
       exp = (npf_ftoa_exp_t)(1 - NPF_DOUBLE_EXP_BIAS);
     }
 
-    { npf_ftoa_exp_t const ae = (exp < 0) ? (npf_ftoa_exp_t)-exp : exp;
+    { int const neg = (exp < 0); // 1 for a negative exponent
+      npf_ftoa_exp_t const ae = neg ? (npf_ftoa_exp_t)-exp : exp;
       end = npf_utoa_rev((npf_uint_t)ae, buf, 10, 0);
-      buf[end++] = (exp < 0) ? '-' : '+';
+      buf[end++] = (char)('+' + 2 * neg); // '-' == '+' + 2
       buf[end++] = (char)('P' + spec->case_adjust);
     }
 
@@ -1614,7 +1614,8 @@ static NPF_NOINLINE int npf_atoa_rev(
           d += carry;
           carry = d >> 4;
           d &= 0xFu;
-          buf[end++] = (char)(((d < 10u) ? '0' : ('A' - 10 + spec->case_adjust)) + (int)d);
+          if (d > 9u) { d += 'A' - 10 - '0'; } // letters sit 7 past the digits
+          buf[end++] = (char)(('0' + (int)d) | spec->case_adjust); // '0'-'9' already have bit 5 set
         }
       }
 
@@ -1637,7 +1638,7 @@ static NPF_NOINLINE int npf_atoa_rev(
 #if NANOPRINTF_USE_BINARY_FORMAT_SPECIFIERS == 1
 static int npf_bin_len(npf_uint_t u) {
   // Return the length of the binary string format of 'u', preferring intrinsics.
-  if (!u) { return 1; }
+  u |= 1u; // 0 is as long as 1, and the intrinsics below need a nonzero input
 
 #ifdef _MSC_VER // Win64, use _BSR64 for everything. If x86, use _BSR when non-large.
   #ifdef _M_X64
@@ -1964,7 +1965,7 @@ int npf_vpprintf(npf_putc pc, void *pc_ctx, char const *format, va_list args) {
       }
 
 #if NANOPRINTF_USE_PRECISION_FORMAT_SPECIFIERS == 1
-      if (!val && !fs.prec) { // an explicit precision of 0 prints nothing for 0
+      if (!fs.prec && !val) { // an explicit precision of 0 prints nothing for 0
         // cbuf_len was initialized to 0; preserved here.
 #if NANOPRINTF_USE_ALT_FORM_FLAG == 1
         if (base == 8u && fs.alt_form) { fs.prec = 1; } // octal '#' special
@@ -2020,7 +2021,10 @@ int npf_vpprintf(npf_putc pc, void *pc_ctx, char const *format, va_list args) {
 #endif
 
     // Total bytes this conversion emits; npf_n is bulk-updated at the end.
-    int spec_len = cbuf_len + !!sign_c + (need_0x ? 2 : 0)
+    /* sign_c is 0, ' ', '+' or '-', all in [0x20, 0x3F], so bit 5 alone counts it;
+       need_0x is 0 or a letter, and every ASCII letter has bit 6 set, so bit 6
+       shifted down to bit 1 counts the two bytes of "0x". */
+    int spec_len = cbuf_len + (sign_c >> 5) + ((need_0x >> 5) & 2)
 #if (NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 1) || \
     (NANOPRINTF_USE_PRECISION_FORMAT_SPECIFIERS == 1)
                    + zero_pad
@@ -2038,11 +2042,8 @@ int npf_vpprintf(npf_putc pc, void *pc_ctx, char const *format, va_list args) {
        fold into zero_pad and the sign/0x is emitted exactly once below. '-'
        overrides '0', and an integer with a precision already dropped the flag.
        What is left for the two field_pad loops is then always spaces. */
-    if (fs.leading_zero_pad && !fs.left_justified) {
-      zero_pad += field_pad;
-      field_pad = 0;
-    }
-    if (!fs.left_justified) {
+    if (!fs.left_justified) { // the '-' flag leaves all of field_pad to the trailing loop
+      if (fs.leading_zero_pad) { zero_pad += field_pad; field_pad = 0; }
       while (field_pad-- > 0) { NPF_PUT(' '); }
     }
 #endif
