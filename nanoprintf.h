@@ -532,8 +532,9 @@ typedef struct npf_format_spec {
 #endif
 #if NANOPRINTF_USE_PRECISION_FORMAT_SPECIFIERS == 1
   int prec;
-  uint8_t prec_opt;
 #endif
+  /* The flags lead the char run, word-aligned after the ints, so their reset per
+     conversion merges into one word store rather than one per byte. */
 #if NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS == 1
   char left_justified;   // '-'
   char leading_zero_pad; // '0'
@@ -541,6 +542,9 @@ typedef struct npf_format_spec {
   char prepend;          // ' ' or '+'
 #if NANOPRINTF_USE_ALT_FORM_FLAG == 1
   char alt_form;         // '#'
+#endif
+#if NANOPRINTF_USE_PRECISION_FORMAT_SPECIFIERS == 1
+  uint8_t prec_opt;
 #endif
   char case_adjust;      // 'a' - 'A' , or 0 (must be non-negative to work)
   uint8_t length_modifier;
